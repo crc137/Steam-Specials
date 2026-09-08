@@ -1,261 +1,198 @@
-#!/usr/bin/env node
-
-const fs = require("fs");
-const path = require("path");
-const axios = require("axios");
-const cheerio = require("cheerio");
-const { Bot, InlineKeyboard } = require("grammy");
-const BOT_TOKEN = process.env.BOT_TOKEN || "";
-const INTERVAL = Number.parseInt(process.env.CHECK_INTERVAL || "600", 10);
-const STATE_FILE = process.env.STATE_FILE || "state.json";
-const CC = process.env.CC || "EE";
-const LANG = process.env.LANG_STEAM || "english";
 const SEARCH_URL = "https://store.steampowered.com/search/results/";
-const PARAMS = {hwtype: 0,maxprice: "free",category1: 998,specials: 1,ndl: 1,json: 1,infinite: 1,start: 0,count: 100,cc: CC,l: LANG};
-const HEADERS = {"User-Agent": "Mozilla/5.0","Accept-Language": "en-US,en;q=0.9"};
-function logInfo(...args) {console.log(new Date().toISOString(),"INFO:",...args);}
-function logWarn(...args) {console.warn(new Date().toISOString(),"WARNING:",...args);}
-function logError(...args) {console.error(new Date().toISOString(),"ERROR:",...args);}
-function sleep(ms) {return new Promise(resolve => setTimeout(resolve, ms));}
-function isTelegramError(error, text) {return (error && typeof error.description === "string" && error.description.toLowerCase().includes(text.toLowerCase()));}
-class State {
-    constructor(filePath) {
-        this.path = filePath;
-        this.users = new Set();
-        this.seen = new Set();
-        this.lock = Promise.resolve();
-        try {
-            if (fs.existsSync(this.path)) {
-                const raw = fs.readFileSync(this.path, "utf8");
-                const data = JSON.parse(raw);
+const HELP = "/start — subscribe to notifications\n/stop — unsubscribe\n/now — see what is free now";
 
-                for (const uid of data.users || []) {this.users.add(Number(uid));}
-                for (const id of data.seen || []) {this.seen.add(String(id));}
-            }
-        } catch (error) {
-            logError("Failed to read state file:", this.path);
-            console.error(error);
-        }
-    }
-    async withLock(fn) {
-        const previous = this.lock;
-        let release;
-        this.lock = new Promise(resolve => {release = resolve;});
-        await previous;
-        try {return await fn();} finally {release();}
-    }
-    flush() {
-        const dir = path.dirname(this.path);
-        fs.mkdirSync(dir, {recursive: true});
-        const tmp = this.path.replace(path.extname(this.path),".tmp");
-        const data = {users: [...this.users].sort((a, b) => a - b),seen: [...this.seen].sort()};
-        fs.writeFileSync(tmp,JSON.stringify(data, null, 2),"utf8");
-        fs.renameSync(tmp, this.path);
-    }
-    async add(uid) {
-        return this.withLock(async () => {
-            const newUser = !this.users.has(uid);
-            this.users.add(uid);
-            if (newUser) {this.flush();}
-            return newUser;
-        });
-    }
-    async remove(uid) {
-        return this.withLock(async () => {
-            const had = this.users.has(uid);
-            this.users.delete(uid);
-            if (had) {this.flush();}
-            return had;
-        });
-    }
-    async mark(ids) {
-        if (!ids.length) {return;}
-        return this.withLock(async () => {
-            const before = this.seen.size;
-            for (const id of ids) {this.seen.add(String(id));}
-            if (this.seen.size !== before) {this.flush();}
-        });
-    }
+function log(...args) { console.log(new Date().toISOString(), ...args); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+
+async function telegram(env, method, body) {
+  const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  if (!data.ok) {
+    const e = new Error(data.description || `Telegram ${method} failed`);
+    e.error_code = data.error_code;
+    e.parameters = data.parameters || {};
+    throw e;
+  }
+  return data.result;
 }
-async function fetchFree() {
-    const response = await axios.get(SEARCH_URL,{params: PARAMS,headers: HEADERS,timeout: 30000,responseType: "json"});
-    const html = response.data?.results_html || "";
-    const $ = cheerio.load(html);
-    const games = [];
-    $("a.search_result_row").each((_, element) => {
-        const row = $(element);
-        const appid = row.attr("data-ds-appid");
-        const block = row.find(".discount_block").first();
-        if (!appid || !block.length) {return;}
-        const priceFinal = block.attr("data-price-final");
-        const discount = block.attr("data-discount");
-        if (!(priceFinal === "0" || priceFinal === 0)) {return;}
-        if (discount !== "100") {return;}
-        const capsule = row.find(".search_capsule img").first();
-        let img = capsule.attr("src");
-        if (img) {img = img.replace("capsule_231x87","header");} else {img =`https://shared.fastly.steamstatic.com/` +`store_item_assets/steam/apps/${appid}/header.jpg`;}
-        const titleNode =row.find(".title").first();
-        const title = titleNode.length? titleNode.text().trim(): `App ${appid}`;
-        games.push({appid: String(appid),title,img,url:`https://store.steampowered.com/app/` +`${appid}/`});
-    });
-    return games;
+
+async function getState(env) {
+  const raw = await env.STATE.get("state");
+  if (!raw) return { users: [], seen: [] };
+  try {
+    const s = JSON.parse(raw);
+    return { users: Array.isArray(s.users) ? s.users.map(String) : [], seen: Array.isArray(s.seen) ? s.seen.map(String) : [] };
+  } catch { return { users: [], seen: [] }; }
 }
-function caption(game) {return (`<b>${escapeHtml(game.title)}</b>\n` +`Free on Steam — yours to keep forever.`);}
-function escapeHtml(text) {return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");}
-function keyboard(game) {return new InlineKeyboard().url("Get on Steam", game.url);}
-async function sendGame(bot, chatId, game) {
-    try {await bot.api.sendPhoto(chatId,game.img,{caption: caption(game),parse_mode: "HTML",reply_markup: keyboard(game)});} catch (error) {
-        if (error?.error_code === 400 || isTelegramError(error, "Bad Request")) {
-            await bot.api.sendMessage(chatId,caption(game),{parse_mode: "HTML",reply_markup: keyboard(game),link_preview_options: {is_disabled: true}});
-            return;
-        }
-        throw error;
+async function saveState(env, state) {
+  state.users = [...new Set(state.users.map(String))];
+  state.seen = [...new Set(state.seen.map(String))];
+  await env.STATE.put("state", JSON.stringify(state));
+}
+
+function parseGames(html) {
+  const games = [];
+  const rowRe = /<a[^>]*class=["'][^"']*search_result_row[^"']*["'][^>]*>[\s\S]*?<\/a>/gi;
+  for (const match of html.matchAll(rowRe)) {
+    const row = match[0];
+    const id = row.match(/data-ds-appid=["']([^"']+)["']/i)?.[1];
+    const block = row.match(/<div[^>]*class=["'][^"']*discount_block[^"']*["'][^>]*>/i)?.[0] || "";
+    const price = block.match(/data-price-final=["']([^"']+)["']/i)?.[1];
+    const discount = block.match(/data-discount=["']([^"']+)["']/i)?.[1];
+    if (!id || price !== "0" || discount !== "100") continue;
+    const titleRaw = row.match(/<div[^>]*class=["'][^"']*title[^"']*["'][^>]*>([\s\S]*?)<\/div>/i)?.[1] || `App ${id}`;
+    const title = titleRaw.replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim();
+    const src = row.match(/<img[^>]*src=["']([^"']+)["'][^>]*>/i)?.[1];
+    const img = src ? src.replace("capsule_231x87", "header") : `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${id}/header.jpg`;
+    games.push({ appid: String(id), title, img, url: `https://store.steampowered.com/app/${id}/` });
+  }
+  return games;
+}
+
+async function fetchFree(env) {
+  const url = new URL(SEARCH_URL);
+  for (const [k, v] of Object.entries({ hwtype: 0, maxprice: "free", category1: 998, specials: 1, ndl: 1, json: 1, infinite: 1, start: 0, count: 100, cc: env.CC || "EE", l: env.LANG_STEAM || "english" })) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9" } });
+  if (!res.ok) throw new Error(`Steam HTTP ${res.status}`);
+  const data = await res.json();
+  return parseGames(data.results_html || "");
+}
+
+function caption(game) { return `<b>${esc(game.title)}</b>\nFree on Steam — yours to keep forever.`; }
+function keyboard(game) { return { inline_keyboard: [[{ text: "Get on Steam", url: game.url }]] }; }
+
+async function sendGame(env, chatId, game) {
+  try {
+    await telegram(env, "sendPhoto", { chat_id: chatId, photo: game.img, caption: caption(game), parse_mode: "HTML", reply_markup: keyboard(game) });
+  } catch (e) {
+    if (e.error_code === 400 || String(e.message).toLowerCase().includes("bad request")) {
+      await telegram(env, "sendMessage", { chat_id: chatId, text: caption(game), parse_mode: "HTML", reply_markup: keyboard(game), link_preview_options: { is_disabled: true } });
+      return;
     }
+    throw e;
+  }
 }
-async function allowed(ctx) {
-    const chat = ctx.chat;
-    if (!chat) {return false;}
-    if (chat.type === "private") {return true;}
-    if (!ctx.from) {return false;}
+
+async function allowed(env, chat, from) {
+  if (!chat) return false;
+  if (chat.type === "private") return true;
+  if (!from) return false;
+  try {
+    const m = await telegram(env, "getChatMember", { chat_id: chat.id, user_id: from.id });
+    return m.status === "administrator" || m.status === "creator";
+  } catch (e) {
+    log("permission check failed", e.message);
+    return false;
+  }
+}
+
+async function addUser(env, id) {
+  const s = await getState(env); const key = String(id);
+  if (s.users.includes(key)) return false;
+  s.users.push(key); await saveState(env, s); return true;
+}
+async function removeUser(env, id) {
+  const s = await getState(env); const key = String(id);
+  const had = s.users.includes(key);
+  s.users = s.users.filter(x => x !== key); await saveState(env, s); return had;
+}
+
+async function handleMessage(env, message) {
+  const chat = message.chat;
+  const text = message.text || "";
+  const command = (text.trim().split(/\s+/)[0] || "").toLowerCase().split("@")[0];
+  if (!["/start", "/stop", "/now"].includes(command)) return;
+  if (!(await allowed(env, chat, message.from))) return;
+
+  if (command === "/start") {
+    const added = await addUser(env, chat.id);
+    await telegram(env, "sendMessage", { chat_id: chat.id, text: (added ? "Subscription activated. I'll notify you as soon as there's a free giveaway on Steam.\n\n" : "You are already subscribed.\n\n") + HELP, link_preview_options: { is_disabled: true } });
+  } else if (command === "/stop") {
+    const removed = await removeUser(env, chat.id);
+    await telegram(env, "sendMessage", { chat_id: chat.id, text: removed ? "Unsubscribed." : "You were not subscribed." });
+  } else if (command === "/now") {
     try {
-        const member = await ctx.api.getChatMember(chat.id,ctx.from.id);
-        return (member.status === "administrator" || member.status === "creator");
-    } catch (error) {
-        logWarn("Failed to check member permissions:",error?.description || error);
-        return false;
+      const games = await fetchFree(env);
+      if (!games.length) { await telegram(env, "sendMessage", { chat_id: chat.id, text: "There are no free giveaways at the moment." }); return; }
+      for (const game of games.slice(0, 10)) { await sendWithRetry(env, chat.id, game); await sleep(100); }
+    } catch (e) {
+      log("/now failed", e.message);
+      await telegram(env, "sendMessage", { chat_id: chat.id, text: "Failed to check Steam right now." });
     }
+  }
 }
-if (!BOT_TOKEN) {
-    console.error("BOT_TOKEN is not set");
-    process.exit(1);
+
+async function sendWithRetry(env, chatId, game) {
+  try { await sendGame(env, chatId, game); }
+  catch (e) {
+    if (e.parameters?.retry_after) { await sleep(Number(e.parameters.retry_after) * 1000); await sendGame(env, chatId, game); }
+    else throw e;
+  }
 }
-const bot = new Bot(BOT_TOKEN);
-let state;
-const HELP = "/start — subscribe to notifications\n" +"/stop — unsubscribe\n" +"/now — see what is free now";
-bot.command("start", async ctx => {
-    if (!(await allowed(ctx))) {return;}
-    const newSubscription = await state.add(ctx.chat.id);
-    const text = newSubscription ? ("Subscription activated. " +"I'll notify you as soon as there's " +"a free giveaway on Steam.\n\n"): "You are already subscribed.\n\n";
-    await ctx.reply(text + HELP,{link_preview_options: {is_disabled: true}});
-});
-bot.command("stop", async ctx => {
-    if (!(await allowed(ctx))) {return;}
-    const removed = await state.remove(ctx.chat.id);
-    await ctx.reply(removed? "Unsubscribed.": "You were not subscribed.");
-});
-bot.command("now", async ctx => {
+
+async function broadcast(env, game) {
+  const state = await getState(env);
+  for (const chatId of state.users) {
+    try { await sendWithRetry(env, chatId, game); }
+    catch (e) {
+      if (e.parameters?.migrate_to_chat_id) {
+        const newId = String(e.parameters.migrate_to_chat_id);
+        await removeUser(env, chatId); await addUser(env, newId);
+        try { await sendWithRetry(env, newId, game); } catch (x) { log("migrated send failed", newId, x.message); }
+      } else if (e.error_code === 403 || String(e.message).toLowerCase().includes("bot was blocked")) {
+        await removeUser(env, chatId);
+      } else { log("send failed", chatId, e.message); }
+    }
+    await sleep(50);
+  }
+}
+
+async function checkSteam(env) {
+  const games = await fetchFree(env);
+  const state = await getState(env);
+  const seen = new Set(state.seen);
+  const fresh = games.filter(g => !seen.has(g.appid));
+  if (!fresh.length) { log("Steam scan: no new free games"); return; }
+  for (const g of fresh) { seen.add(g.appid); }
+  state.seen = [...seen];
+  await saveState(env, state);
+  for (const game of fresh) { log(`new free: ${game.title} (${game.appid})`); await broadcast(env, game); }
+}
+
+async function initialScan(env) {
+  const state = await getState(env);
+  if (state.seen.length) return;
+  const games = await fetchFree(env);
+  state.seen = games.map(g => g.appid);
+  await saveState(env, state);
+  log(`Initial Steam scan: ${games.length} games`);
+}
+
+export default {
+  async fetch(request, env) {
+    if (request.method === "GET") return new Response("Steam-Specials Worker OK", { status: 200 });
+    if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+    if (!env.BOT_TOKEN || !env.STATE) return new Response("Worker is not configured", { status: 500 });
     try {
-        const games = await fetchFree();
-        if (!games.length) {
-            await ctx.reply("There are no free giveaways at the moment.");
-            return;
+      const update = await request.json();
+      if (update.message) await handleMessage(env, update.message);
+      if (update.my_chat_member) {
+        const u = update.my_chat_member; const chat = u.chat;
+        if (chat.type !== "private") {
+          const joined = ["member", "administrator", "creator"].includes(u.new_chat_member?.status);
+          if (joined) await addUser(env, chat.id); else await removeUser(env, chat.id);
         }
-        for (const game of games.slice(0, 10)) {
-            try {await sendGame(bot,ctx.chat.id,game);} catch (error) {
-                const retryAfter = error?.parameters?.retry_after;
-                if (retryAfter) {
-                    logWarn("Rate limited while /now:",`retry_after=${retryAfter}`);
-                    await sleep(retryAfter * 1000);
-                    await sendGame(bot,ctx.chat.id,game);
-                } else {throw error;}
-            }
-            await sleep(100);
-        }
-    } catch (error) {logError("/now failed:",error?.description || error);await ctx.reply("Failed to check Steam right now.");}
-});
-bot.on("my_chat_member", async ctx => {
-    const update = ctx.myChatMember;
-    if (!update) {return;}
-    const chat = update.chat;
-    if (chat.type === "private") {return;}
-    const status = update.new_chat_member.status;
-    const joined = new Set(["member","administrator","creator"]);
-    if (joined.has(status)) {
-        const added = await state.add(chat.id);
-        if (added) {logInfo(`subscribed chat ${chat.id} (${chat.type})`);}
-    } else {await state.remove(chat.id);}
-});
-async function broadcast(game) {
-    const dead = [];
-    const users = [...state.users];
-    for (const chatId of users) {
-        try {await sendGame(bot,chatId,game);}
-        catch (error) {
-            const retryAfter = error?.parameters?.retry_after;
-            if (retryAfter) {
-                const delay = Math.max(1,Math.floor(retryAfter));
-                logWarn(`Telegram rate limit for chat ${chatId}; ` +`waiting ${delay}s`);
-                await sleep(delay * 1000);
-                try {await sendGame(bot,chatId,game);}
-                catch (retryError) {if (retryError?.error_code === 403 || isTelegramError(retryError,"bot was blocked")) {dead.push(chatId);} else {logWarn(`retry send ${chatId} failed:`,retryError?.description || retryError);}
-                }
-            }
-            else if (error?.parameters?.migrate_to_chat_id) {
-                const oldChatId = chatId;
-                const newChatId = error.parameters.migrate_to_chat_id;
-                logInfo(`Migrating chat ${oldChatId} -> ${newChatId}`);
-                await state.remove(oldChatId);
-                await state.add(newChatId);
-                try {await sendGame(bot,newChatId,game);} catch (migrateError) {logWarn(`send migrated chat ${newChatId} failed:`,migrateError?.description || migrateError);}
-            }
-            else if (error?.error_code === 403 || isTelegramError(error,"bot was blocked")) {dead.push(chatId);}
-            else {logWarn(`send ${chatId} failed:`,error?.description || error);}
-        }
-        await sleep(50);
-    }
-    for (const chatId of dead) {await state.remove(chatId);}
-}
-async function watcher() {
-    while (true) {
-        try {
-            const games = await fetchFree();
-            const fresh = games.filter(game => !state.seen.has(game.appid));
-            if (fresh.length) {
-                await state.mark(fresh.map(game => game.appid));
-                for (const game of fresh) {
-                    logInfo(`new free: ${game.title} (${game.appid})`);
-                    await broadcast(game);
-                }
-            }
-        }
-        catch (error) {logError("check failed:",error?.stack || error?.description || error);}
-        await sleep(INTERVAL * 1000);
-    }
-}
-async function main() {
-    state = new State(STATE_FILE);
-    const me = await bot.api.getMe();
-    logInfo(`Starting @${me.username} id=${me.id} PID=${process.pid}`);
-    if (state.seen.size === 0) {
-        try {
-            const games = await fetchFree();
-            await state.mark(games.map(game => game.appid));
-            logInfo(`Initial Steam scan: ${games.length} games`);
-        }
-        catch (error) {logError("Initial Steam scan failed:", error?.stack || error?.description || error);}
-    }
-    const watcherPromise = watcher();
-    try {
-        logInfo("Starting Telegram polling");
-        await bot.start({onStart: botInfo => {logInfo(`Telegram polling started as @${botInfo.username}`);}});
-    }
-    finally {
-        logInfo("Stopping bot");
-        await bot.stop();
-        void watcherPromise;
-    }
-}
-let shuttingDown = false;
-async function shutdown(signal) {
-    if (shuttingDown) {return;}
-    shuttingDown = true;
-    logInfo(`Received ${signal}, stopping bot...`);
-    try {await bot.stop();} catch (error) {logWarn("Error while stopping bot:",error);}
-    process.exit(0);
-}
-process.once("SIGINT",() => shutdown("SIGINT"));
-process.once("SIGTERM",() => shutdown("SIGTERM"));
-main().catch(error => {
-    logError("Fatal error:", error?.stack || error?.description || error);
-    process.exit(1);
-});
+      }
+      return new Response("ok");
+    } catch (e) { log("webhook error", e.stack || e.message); return new Response("ok"); }
+  },
+  async scheduled(event, env) {
+    try { await initialScan(env); await checkSteam(env); }
+    catch (e) { log("scheduled check failed", e.stack || e.message); }
+  }
+};
