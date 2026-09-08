@@ -1,4 +1,4 @@
-name = "steam-free-bot"
+name = "steam-specials"
 main = "src/worker.js"
 compatibility_date = "2026-09-08"
 
