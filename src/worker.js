@@ -5,8 +5,14 @@ function log(...args) { console.log(new Date().toISOString(), ...args); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 
+function botToken(env) {
+  return env.BOT_TOKEN || env.TELEGRAM_BOT_TOKEN || "";
+}
+
 async function telegram(env, method, body) {
-  const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
+  const token = botToken(env);
+  if (!token) throw new Error("BOT_TOKEN secret is missing");
+  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
@@ -175,10 +181,17 @@ async function initialScan(env) {
 
 export default {
   async fetch(request, env) {
-    if (request.method === "GET") return new Response("Steam-Specials Worker OK", { status: 200 });
-    if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-    if (!env.BOT_TOKEN || !env.STATE) return new Response("Worker is not configured", { status: 500 });
     try {
+      if (request.method === "GET") return new Response("Steam-Specials Worker OK", { status: 200 });
+      if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+
+      const hasToken = Boolean(botToken(env));
+      const hasState = Boolean(env.STATE);
+      if (!hasToken || !hasState) {
+        log("webhook configuration error", { hasToken, hasState });
+        return new Response("Worker is not configured", { status: 500 });
+      }
+
       const update = await request.json();
       if (update.message) await handleMessage(env, update.message);
       if (update.my_chat_member) {
@@ -188,8 +201,11 @@ export default {
           if (joined) await addUser(env, chat.id); else await removeUser(env, chat.id);
         }
       }
-      return new Response("ok");
-    } catch (e) { log("webhook error", e.stack || e.message); return new Response("ok"); }
+      return new Response("ok", { status: 200 });
+    } catch (e) {
+      log("webhook error", e.stack || e.message);
+      return new Response("ok", { status: 200 });
+    }
   },
   async scheduled(event, env) {
     try { await initialScan(env); await checkSteam(env); }
