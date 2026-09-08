@@ -1,0 +1,10 @@
+name = "steam-free-bot"
+main = "src/worker.js"
+compatibility_date = "2026-09-08"
+
+[triggers]
+crons = ["*/10 * * * *"]
+
+[[kv_namespaces]]
+binding = "STATE"
+id = "YOUR_KV_NAMESPACE_ID"
