@@ -113,10 +113,7 @@ async function handleMessage(env, message) {
   const text = message.text || "";
   const command = (text.trim().split(/\s+/)[0] || "").toLowerCase().split("@")[0];
   if (!["/start", "/stop", "/now"].includes(command)) return;
-  if (!(await allowed(env, chat, message.from))) {
-    if (chat.type !== "private") await telegram(env, "sendMessage", { chat_id: chat.id, text: "I need the admin..." });
-    return;
-  }
+  if (!(await allowed(env, chat, message.from))) return;
 
   if (command === "/start") {
     const added = await addUser(env, chat.id);
